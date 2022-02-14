@@ -1,12 +1,13 @@
+import argparse
+import time
+
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
 import torchvision
 import torchvision.transforms as transforms
-import numpy as np
-import time
-import argparse
-
+from torch.utils.data import DataLoader
 
 parser = argparse.ArgumentParser()
 
@@ -29,6 +30,7 @@ parser.add_argument('--clip-norm', action='store_true')
 parser.add_argument('--epochs', default=25, type=int)
 parser.add_argument('--lr-max', default=0.01, type=float)
 parser.add_argument('--workers', default=2, type=int)
+parser.add_argument('--model-name', default="convmixer", choices=["convmixer", "baseline"], type=str)
 
 args = parser.parse_args()
 
@@ -48,16 +50,37 @@ def ConvMixer(dim, depth, kernel_size=5, patch_size=2, n_classes=10):
         nn.GELU(),
         nn.BatchNorm2d(dim),
         *[nn.Sequential(
-                Residual(nn.Sequential(
-                    nn.Conv2d(dim, dim, kernel_size, groups=dim, padding="same"),
-                    nn.GELU(),
-                    nn.BatchNorm2d(dim)
-                )),
-                nn.Conv2d(dim, dim, kernel_size=1),
+            Residual(nn.Sequential(
+                nn.Conv2d(dim, dim, kernel_size, groups=dim, padding="same"),
                 nn.GELU(),
                 nn.BatchNorm2d(dim)
-        ) for i in range(depth)],
-        nn.AdaptiveAvgPool2d((1,1)),
+            )),
+            nn.Conv2d(dim, dim, kernel_size=1),
+            nn.GELU(),
+            nn.BatchNorm2d(dim)
+        ) for _ in range(depth)],
+        nn.AdaptiveAvgPool2d((1, 1)),
+        nn.Flatten(),
+        nn.Linear(dim, n_classes)
+    )
+
+
+def ComparableNet(dim, depth, kernel_size=5, patch_size=2, n_classes=10):
+    return nn.Sequential(
+        nn.Conv2d(3, dim, kernel_size=3, stride=1),
+        nn.GELU(),
+        nn.BatchNorm2d(dim),
+        *[nn.Sequential(
+            Residual(nn.Sequential(
+                nn.Conv2d(dim, dim, kernel_size, groups=dim, padding="same"),
+                nn.GELU(),
+                nn.BatchNorm2d(dim)
+            )),
+            nn.Conv2d(dim, dim, kernel_size=1),
+            nn.GELU(),
+            nn.BatchNorm2d(dim)
+        ) for _ in range(depth)],
+        nn.AdaptiveAvgPool2d((1, 1)),
         nn.Flatten(),
         nn.Linear(dim, n_classes)
     )
@@ -83,26 +106,26 @@ test_transform = transforms.Compose([
 
 trainset = torchvision.datasets.CIFAR10(root='./data', train=True,
                                         download=True, transform=train_transform)
-trainloader = torch.utils.data.DataLoader(trainset, batch_size=args.batch_size,
-                                          shuffle=True, num_workers=args.workers)
+trainloader = DataLoader(trainset, batch_size=args.batch_size,
+                         shuffle=True, num_workers=args.workers)
 
 testset = torchvision.datasets.CIFAR10(root='./data', train=False,
                                        download=True, transform=test_transform)
-testloader = torch.utils.data.DataLoader(testset, batch_size=args.batch_size,
-                                         shuffle=False, num_workers=args.workers)
+testloader = DataLoader(testset, batch_size=args.batch_size,
+                        shuffle=False, num_workers=args.workers)
 
-
-model = ConvMixer(args.hdim, args.depth, patch_size=args.psize, kernel_size=args.conv_ks, n_classes=10)
+if args.model_name == "convmixer":
+    model = ConvMixer(args.hdim, args.depth, patch_size=args.psize, kernel_size=args.conv_ks, n_classes=10)
+else:
+    model = ComparableNet(args.hdim, args.depth, patch_size=args.psize, kernel_size=args.conv_ks, n_classes=10)
 model = nn.DataParallel(model).cuda()
 
-
-lr_schedule = lambda t: np.interp([t], [0, args.epochs*2//5, args.epochs*4//5, args.epochs], 
-                                  [0, args.lr_max, args.lr_max/20.0, 0])[0]
+lr_schedule = lambda t: np.interp([t], [0, args.epochs * 2 // 5, args.epochs * 4 // 5, args.epochs],
+                                  [0, args.lr_max, args.lr_max / 20.0, 0])[0]
 
 opt = optim.AdamW(model.parameters(), lr=args.lr_max, weight_decay=args.wd)
 criterion = nn.CrossEntropyLoss()
 scaler = torch.cuda.amp.GradScaler()
-
 
 for epoch in range(args.epochs):
     start = time.time()
@@ -111,7 +134,7 @@ for epoch in range(args.epochs):
         model.train()
         X, y = X.cuda(), y.cuda()
 
-        lr = lr_schedule(epoch + (i + 1)/len(trainloader))
+        lr = lr_schedule(epoch + (i + 1) / len(trainloader))
         opt.param_groups[0].update(lr=lr)
 
         opt.zero_grad()
@@ -125,11 +148,11 @@ for epoch in range(args.epochs):
             nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         scaler.step(opt)
         scaler.update()
-        
+
         train_loss += loss.item() * y.size(0)
         train_acc += (output.max(1)[1] == y).sum().item()
         n += y.size(0)
-        
+
     model.eval()
     test_acc, m = 0, 0
     with torch.no_grad():
@@ -140,5 +163,5 @@ for epoch in range(args.epochs):
             test_acc += (output.max(1)[1] == y).sum().item()
             m += y.size(0)
 
-    print(f'[{args.name}] Epoch: {epoch} | Train Acc: {train_acc/n:.4f}, Test Acc: {test_acc/m:.4f}, Time: {time.time() - start:.1f}, lr: {lr:.6f}')
-
+    print(
+        f'[{args.name}] Epoch: {epoch} | Train Acc: {train_acc / n:.4f}, Test Acc: {test_acc / m:.4f}, Time: {time.time() - start:.1f}, lr: {lr:.6f}')
