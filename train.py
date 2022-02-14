@@ -1,4 +1,5 @@
 import argparse
+import os
 import time
 
 import numpy as np
@@ -8,6 +9,7 @@ import torch.optim as optim
 import torchvision
 import torchvision.transforms as transforms
 from torch.utils.data import DataLoader
+from torch.utils.tensorboard import SummaryWriter
 
 parser = argparse.ArgumentParser()
 
@@ -126,42 +128,47 @@ lr_schedule = lambda t: np.interp([t], [0, args.epochs * 2 // 5, args.epochs * 4
 opt = optim.AdamW(model.parameters(), lr=args.lr_max, weight_decay=args.wd)
 criterion = nn.CrossEntropyLoss()
 scaler = torch.cuda.amp.GradScaler()
-
-for epoch in range(args.epochs):
-    start = time.time()
-    train_loss, train_acc, n = 0, 0, 0
-    for i, (X, y) in enumerate(trainloader):
-        model.train()
-        X, y = X.cuda(), y.cuda()
-
-        lr = lr_schedule(epoch + (i + 1) / len(trainloader))
-        opt.param_groups[0].update(lr=lr)
-
-        opt.zero_grad()
-        with torch.cuda.amp.autocast():
-            output = model(X)
-            loss = criterion(output, y)
-
-        scaler.scale(loss).backward()
-        if args.clip_norm:
-            scaler.unscale_(opt)
-            nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-        scaler.step(opt)
-        scaler.update()
-
-        train_loss += loss.item() * y.size(0)
-        train_acc += (output.max(1)[1] == y).sum().item()
-        n += y.size(0)
-
-    model.eval()
-    test_acc, m = 0, 0
-    with torch.no_grad():
-        for i, (X, y) in enumerate(testloader):
+writer = SummaryWriter(log_dir=os.path.join("./output", args.model_name))
+with writer:
+    for epoch in range(args.epochs):
+        start = time.time()
+        train_loss, train_acc, n = 0, 0, 0
+        for i, (X, y) in enumerate(trainloader):
+            model.train()
             X, y = X.cuda(), y.cuda()
+
+            lr = lr_schedule(epoch + (i + 1) / len(trainloader))
+            opt.param_groups[0].update(lr=lr)
+
+            opt.zero_grad()
             with torch.cuda.amp.autocast():
                 output = model(X)
-            test_acc += (output.max(1)[1] == y).sum().item()
-            m += y.size(0)
+                loss = criterion(output, y)
 
-    print(
-        f'[{args.name}] Epoch: {epoch} | Train Acc: {train_acc / n:.4f}, Test Acc: {test_acc / m:.4f}, Time: {time.time() - start:.1f}, lr: {lr:.6f}')
+            scaler.scale(loss).backward()
+            if args.clip_norm:
+                scaler.unscale_(opt)
+                nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            scaler.step(opt)
+            scaler.update()
+
+            train_loss += loss.item() * y.size(0)
+            train_acc += (output.max(1)[1] == y).sum().item()
+            n += y.size(0)
+
+        model.eval()
+        test_acc, m = 0, 0
+        with torch.no_grad():
+            for i, (X, y) in enumerate(testloader):
+                X, y = X.cuda(), y.cuda()
+                with torch.cuda.amp.autocast():
+                    output = model(X)
+                test_acc += (output.max(1)[1] == y).sum().item()
+                m += y.size(0)
+
+        print(
+            f'[{args.name}] Epoch: {epoch} | Train Acc: {train_acc / n:.4f}, Test Acc: {test_acc / m:.4f}, '
+            f'Time: {time.time() - start:.1f}, lr: {lr:.6f}')
+        writer.add_scalar(tag="tra/loss", scalar_value=train_loss / n, global_step=epoch)
+        writer.add_scalar(tag="tra/acc", scalar_value=train_acc / n, global_step=epoch)
+        writer.add_scalar(tag="test/acc", scalar_value=test_acc / m, global_step=epoch)
